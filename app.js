@@ -6,6 +6,8 @@
  - Recibo: jsPDF + Share Sheet
  - PayLink: COMPARTIR (no abrir) + copiar fallback
  - CONTACTOS: users/{uid}/contacts (buscar, usar, prefill)
+ - HISTORIAL: Compartir / Editar / Borrar
+ - REPORTE DIARIO: PDF + Share Sheet
 *********************************************************/
 
 console.log("app.js ✅", new Date().toISOString());
@@ -30,7 +32,7 @@ const CONFIG = {
   links: {
     ath: "https://pagos.athmovilapp.com/pagoPorCodigo.html?id=8fbf89be-ac6a-4a00-b4d8-a7020c474660",
     stripe: "https://buy.stripe.com/5kQ9AS8nQ2mA6w6aFV1RC0h",
-    tapToPay: ""
+    tapToPay: "" // (si luego pones link real, se usa aquí)
   },
   icons: {
     stripe: "assets/icons/stripe.png",
@@ -38,7 +40,7 @@ const CONFIG = {
     tap: "assets/icons/tap.png",
     cash: "assets/icons/cash.png",
     checks: "assets/icons/checks.png",
-    contacts: "assets/icons/contacts.png" // ✅ correcto
+    contacts: "assets/icons/contacts.png"
   },
   qr: {
     stripe: "assets/qr-stripe.png",
@@ -73,9 +75,10 @@ const historyModal = document.getElementById("historyModal");
 const btnCloseHistory = document.getElementById("btnCloseHistory");
 const btnRefresh = document.getElementById("btnRefresh");
 const btnLogout = document.getElementById("btnLogout");
+const btnDailyReport = document.getElementById("btnDailyReport");
 const historyTableBody = document.querySelector("#historyTable tbody");
 
-// ===== Contactos modal (si existe en HTML) =====
+// ===== Contactos modal =====
 const contactsModal = document.getElementById("contactsModal");
 const btnCloseContacts = document.getElementById("btnCloseContacts");
 const btnNewContact = document.getElementById("btnNewContact");
@@ -107,7 +110,7 @@ const METHODS = [
   { id:"checks", label:"Checks", icon: CONFIG.icons.checks, mode:"manual" },
   { id:"stripe_link", label:"Stripe Link", icon: CONFIG.icons.stripe, mode:"paylink", link: () => CONFIG.links.stripe },
   { id:"ath_link", label:"ATH Link", icon: CONFIG.icons.ath, mode:"paylink", link: () => CONFIG.links.ath },
-  { id:"contacts", label:"Contactos", icon: CONFIG.icons.contacts, mode:"contacts" } // ✅ icono correcto
+  { id:"contacts", label:"Contactos", icon: CONFIG.icons.contacts, mode:"contacts" }
 ];
 
 const state = { method:null, contact:null, form:{ name:"", phone:"", amount:"", note:"" } };
@@ -136,7 +139,7 @@ function fmtDate(v){
 }
 function uid(){ return auth.currentUser?.uid || null; }
 
-// ===== Auth (Email/Password) =====
+// ===== Auth =====
 function setAuthHint(msg){ if(authHint) authHint.textContent = msg || ""; }
 
 async function doLogin(){
@@ -190,7 +193,6 @@ function selectMethod(idSel){
   const m = METHODS.find(x=>x.id===idSel);
   if(!m) return;
 
-  // ✅ Contactos: solo abre modal
   if(m.mode === "contacts"){
     openContacts();
     return;
@@ -199,7 +201,6 @@ function selectMethod(idSel){
   state.method = m;
   methodBadge.textContent = `Método: ${m.label}`;
 
-  // ✅ Prefill desde Contactos si aplica
   if(state.contact){
     nameEl.value  = state.contact.name || "";
     phoneEl.value = state.contact.phone || "";
@@ -328,6 +329,21 @@ async function loadPaymentsCloud(limit=60){
   return snap.docs.map(d=>({ id:d.id, ...d.data() }));
 }
 
+async function updatePaymentCloud(paymentId, patch){
+  const u = uid();
+  if(!u) throw new Error("No hay sesión activa.");
+  await db.collection("users").doc(u).collection("payments").doc(paymentId).set({
+    ...patch,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }, { merge:true });
+}
+
+async function deletePaymentCloud(paymentId){
+  const u = uid();
+  if(!u) throw new Error("No hay sesión activa.");
+  await db.collection("users").doc(u).collection("payments").doc(paymentId).delete();
+}
+
 // ===== Recibo jsPDF =====
 async function printReceipt(payment){
   const { jsPDF } = window.jspdf;
@@ -438,6 +454,7 @@ async function refreshHistory(){
   try{
     const cloud=await loadPaymentsCloud(60);
     rows = cloud.map(p=>({
+      id: p.id,
       date: fmtDate(p.createdAt || p.dateISO),
       name: p.customerName || "—",
       method: p.method || "—",
@@ -461,9 +478,16 @@ async function refreshHistory(){
       <td>${r.method}</td>
       <td class="r">$${money(r.amount)}</td>
       <td>${r.receipt}</td>
-      <td><button class="btn btnGhost">Compartir</button></td>
+      <td>
+        <div class="btnRow" style="justify-content:flex-end; gap:8px;">
+          <button class="btn btnGhost" type="button" data-act="share">Compartir</button>
+          <button class="btn btnGhost" type="button" data-act="edit">Editar</button>
+          <button class="btn btnDanger" type="button" data-act="del">Borrar</button>
+        </div>
+      </td>
     `;
-    tr.querySelector("button").onclick = async ()=>{
+
+    tr.querySelector('[data-act="share"]').onclick = async ()=>{
       const p=r.raw;
       const payment = {
         receiptNo: p.receiptNo || r.receipt,
@@ -477,8 +501,163 @@ async function refreshHistory(){
       };
       await printReceipt(payment);
     };
+
+    tr.querySelector('[data-act="edit"]').onclick = async ()=>{
+      try{
+        const p = r.raw;
+        const newAmount = prompt("Nuevo monto ($):", String(p.amount ?? r.amount ?? 0));
+        if(newAmount === null) return;
+
+        const amt = Number(newAmount);
+        if(Number.isNaN(amt) || amt < 0) return alert("Monto inválido.");
+
+        const newNote = prompt("Nueva nota (opcional):", String(p.note ?? ""));
+
+        await updatePaymentCloud(r.id, {
+          amount: amt,
+          note: (newNote ?? "").toString()
+        });
+
+        await refreshHistory();
+      }catch(e){
+        console.warn(e);
+        alert("No pude editar. Revisa permisos/reglas.");
+      }
+    };
+
+    tr.querySelector('[data-act="del"]').onclick = async ()=>{
+      try{
+        if(!confirm("¿Borrar este pago del historial?")) return;
+        await deletePaymentCloud(r.id);
+        await refreshHistory();
+      }catch(e){
+        console.warn(e);
+        alert("No pude borrar. Revisa permisos/reglas.");
+      }
+    };
+
     historyTableBody.appendChild(tr);
   });
+}
+
+// =======================
+// REPORTE DIARIO (PDF)
+// =======================
+btnDailyReport?.addEventListener("click", async ()=>{
+  try{
+    if(!uid()) return alert("Inicia sesión para generar reportes.");
+    const report = await getDailySalesReport(new Date());
+    await printDailySalesReport(report);
+  }catch(e){
+    console.warn(e);
+    alert("No pude generar el reporte. Si Firestore pide índice, te dará el link para crearlo.");
+  }
+});
+
+async function getDailySalesReport(date = new Date()){
+  const u = uid();
+  if(!u) throw new Error("No hay sesión activa.");
+
+  const start = new Date(date); start.setHours(0,0,0,0);
+  const end   = new Date(date); end.setHours(23,59,59,999);
+
+  const snap = await db.collection("users").doc(u).collection("payments")
+    .where("createdAt", ">=", firebase.firestore.Timestamp.fromDate(start))
+    .where("createdAt", "<=", firebase.firestore.Timestamp.fromDate(end))
+    .orderBy("createdAt","asc")
+    .limit(1500)
+    .get();
+
+  const payments = snap.docs.map(d=>({ id:d.id, ...d.data() }));
+
+  let total = 0;
+  const byMethod = {};
+  const byCount = {};
+
+  payments.forEach(p=>{
+    const amt = Number(p.amount || 0);
+    total += amt;
+    const m = String(p.method || "—");
+    byMethod[m] = (byMethod[m] || 0) + amt;
+    byCount[m]  = (byCount[m]  || 0) + 1;
+  });
+
+  const count = payments.length;
+  const avg = count ? (total / count) : 0;
+
+  return { date, start, end, payments, total, count, avg, byMethod, byCount };
+}
+
+async function printDailySalesReport(r){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:"mm", format:"a4" });
+
+  let y = 16;
+
+  doc.setFont("helvetica","bold");
+  doc.setFontSize(16);
+  doc.text("REPORTE DIARIO DE VENTAS", 14, y); y+=8;
+
+  doc.setFont("helvetica","normal");
+  doc.setFontSize(11);
+  doc.text(`${CONFIG.brand.business}`, 14, y); y+=6;
+  doc.text(`Fecha: ${r.start.toLocaleDateString("es-PR")}`, 14, y); y+=6;
+  doc.text(`Transacciones: ${r.count}`, 14, y); y+=6;
+  doc.text(`Total: $${money(r.total)}`, 14, y); y+=6;
+  doc.text(`Ticket promedio: $${money(r.avg)}`, 14, y); y+=10;
+
+  doc.setFont("helvetica","bold");
+  doc.text("Por método:", 14, y); y+=6;
+
+  doc.setFont("helvetica","normal");
+  const entries = Object.entries(r.byMethod).sort((a,b)=>b[1]-a[1]);
+
+  if(!entries.length){
+    doc.text("Sin ventas registradas hoy.", 14, y); y+=8;
+  }else{
+    entries.forEach(([m,total])=>{
+      const c = r.byCount[m] || 0;
+      doc.text(`${m}: $${money(total)}  (${c})`, 18, y);
+      y+=6;
+    });
+    y+=6;
+  }
+
+  doc.setFont("helvetica","bold");
+  doc.text("Detalle (Top 40):", 14, y); y+=6;
+  doc.setFont("helvetica","normal");
+
+  const list = r.payments.slice(0,40);
+  if(!list.length){
+    doc.text("No hay registros hoy.", 14, y); y+=6;
+  }else{
+    list.forEach(p=>{
+      const dt = p.createdAt?.seconds ? new Date(p.createdAt.seconds*1000) : new Date(p.dateISO || Date.now());
+      const time = dt.toLocaleTimeString("es-PR",{hour:"2-digit",minute:"2-digit"});
+      const name = (p.customerName || "—").toString().slice(0,22);
+      const meth = (p.method || "—").toString().slice(0,12);
+      const amt  = `$${money(p.amount)}`;
+
+      doc.text(`${time}  ${name}  ${meth}  ${amt}`, 14, y);
+      y+=6;
+      if(y > 285){ doc.addPage(); y = 16; }
+    });
+  }
+
+  const filename = `DailySales-${r.start.toISOString().slice(0,10)}.pdf`;
+  const blob = doc.output("blob");
+  const file = new File([blob], filename, { type:"application/pdf" });
+
+  if(navigator.share && navigator.canShare && navigator.canShare({ files:[file] })){
+    try{
+      await navigator.share({ title:"Reporte diario", files:[file] });
+      return;
+    }catch(e){
+      console.warn("Share cancelado:", e);
+    }
+  }
+
+  doc.save(filename);
 }
 
 // =======================
