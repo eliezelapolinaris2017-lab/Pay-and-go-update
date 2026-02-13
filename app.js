@@ -37,6 +37,7 @@ const CONFIG = {
     tap: "assets/icons/tap.png",
     cash: "assets/icons/cash.png",
     checks: "assets/icons/checks.png"
+    contacts: "assets/icons/contacts.png"
   },
   qr: {
     stripe: "assets/qr-stripe.png",
